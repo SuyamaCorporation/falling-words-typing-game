@@ -1,0 +1,339 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>落下 単語 タイピング ゲーム</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <style>
+    body { background: #0f172a; }
+    canvas { display: block; margin: 0 auto; border-radius: 12px; }
+    @keyframes life-lost {
+      0%,100% { transform:scale(1); }
+      50% { transform:scale(1.4); color:red; }
+    }
+    .life-anim { animation: life-lost 0.4s ease; }
+    @keyframes score-pop {
+      from { opacity:1; transform:translateY(0); }
+      to   { opacity:0; transform:translateY(-30px); }
+    }
+    .score-pop { position:fixed; pointer-events:none; font-weight:bold; color:#4ade80; font-size:1.2rem;
+      animation: score-pop 0.8s ease-out forwards; }
+  </style>
+</head>
+<body class="min-h-screen flex flex-col items-center justify-start py-6 px-2">
+
+  <h1 class="text-3xl font-bold text-white mb-1">⌨️ 落下 単語 タイピング</h1>
+  <p class="text-slate-400 text-sm mb-4">単語が落ちる前に正確に入力して消そう！</p>
+
+  <!-- HUD -->
+  <div class="flex gap-6 mb-4 text-center">
+    <div class="bg-slate-800 rounded-xl px-4 py-2">
+      <div class="text-yellow-400 font-bold text-xl" id="score-disp">0</div>
+      <div class="text-slate-400 text-xs">スコア</div>
+    </div>
+    <div class="bg-slate-800 rounded-xl px-4 py-2">
+      <div class="text-red-400 font-bold text-xl" id="lives-disp">❤️❤️❤️</div>
+      <div class="text-slate-400 text-xs">ライフ</div>
+    </div>
+    <div class="bg-slate-800 rounded-xl px-4 py-2">
+      <div class="text-purple-400 font-bold text-xl" id="level-disp">1</div>
+      <div class="text-slate-400 text-xs">レベル</div>
+    </div>
+    <div class="bg-slate-800 rounded-xl px-4 py-2">
+      <div class="text-green-400 font-bold text-xl" id="best-disp">0</div>
+      <div class="text-slate-400 text-xs">ベスト</div>
+    </div>
+  </div>
+
+  <!-- Canvas -->
+  <canvas id="game" width="600" height="400"></canvas>
+
+  <!-- Input -->
+  <div class="mt-4 w-full max-w-[600px] flex gap-2">
+    <input id="type-input" type="text" autocomplete="off" autocorrect="off" spellcheck="false"
+      placeholder="単語を入力..."
+      class="flex-1 bg-slate-700 text-white text-xl font-mono px-4 py-3 rounded-xl border-2 border-slate-600 focus:border-indigo-400 outline-none transition"
+      aria-label="単語入力欄" />
+  </div>
+
+  <!-- Start/Over overlay (rendered on canvas by JS) -->
+  <div id="overlay" class="mt-4 text-center">
+    <button id="start-btn" onclick="startGame()"
+      class="px-8 py-3 bg-indigo-600 hover:bg-indigo-500 text-white rounded-xl font-bold text-lg transition"
+      aria-label="ゲームスタート">スタート</button>
+  </div>
+
+<script>
+// ── Word list (100 words, difficulty-tagged) ───────────────
+const WORDS = {
+  easy: [
+    'cat','dog','sun','run','fun','cup','top','hot','big','red',
+    'yes','box','map','pen','sky','egg','arm','leg','fly','cry',
+    'key','hat','bat','bed','car','far','bar','air','sea','tea',
+    'ice','ago','act','age','ask','add','end','ear','eye','aim',
+    'bad','bag','ban','bay','bit','bow','boy','bud','bug','bus',
+  ],
+  medium: [
+    'apple','bread','candy','dance','eagle','flame','grape','house',
+    'image','juice','knife','lemon','magic','night','ocean','piano',
+    'queen','river','snake','tiger','ultra','video','water','xenon',
+    'yacht','zebra','brave','cloud','dream','earth','frost','green',
+    'heart','ivory','jewel','kiwis','light','medal','nurse','olive',
+    'peach','quick','roast','storm','track','umbra','visit','witch',
+    'extra','youth',
+  ],
+  hard: [
+    'abstract','blanket','captain','dolphin','element','fantasy',
+    'gravity','harvest','illusion','journey','kitchen','lantern',
+    'mystery','network','obstacle','pilgrim','quantum','rainbow',
+    'silence','trumpet','ultimate','venture','whisper','xylorite',
+    'younger','zealous','abandon','beneath','century','distant',
+    'example','freedom','genuine','horizon','imagine','justice',
+    'kingdom','lantern','mention','nothing',
+  ],
+};
+
+// ── Game state ─────────────────────────────────────────────
+const canvas = document.getElementById('game');
+const ctx = canvas.getContext('2d');
+let gameRunning = false;
+let rafId = null;
+let fallingWords = [];
+let score = 0;
+let lives = 3;
+let level = 1;
+let frameCount = 0;
+let spawnInterval = 120; // frames between spawns
+let baseSpeed = 0.6;
+let currentInput = '';
+
+function loadBest() { return parseInt(localStorage.getItem('typegame_best')||'0',10); }
+function saveBest(v) { localStorage.setItem('typegame_best', String(v)); }
+
+// ── Responsive canvas ──────────────────────────────────────
+function resizeCanvas() {
+  const maxW = Math.min(600, window.innerWidth - 32);
+  canvas.style.width = maxW + 'px';
+  canvas.style.height = Math.round(maxW * 2/3) + 'px';
+}
+resizeCanvas();
+window.addEventListener('resize', resizeCanvas);
+
+// ── Word spawning ──────────────────────────────────────────
+function pickWord() {
+  let pool = level <= 3 ? WORDS.easy : level <= 7 ? WORDS.medium : WORDS.hard;
+  // avoid duplicates on screen
+  const active = new Set(fallingWords.map(w=>w.word));
+  const filtered = pool.filter(w => !active.has(w));
+  const src = filtered.length ? filtered : pool;
+  return src[Math.floor(Math.random() * src.length)];
+}
+
+function spawnWord() {
+  const word = pickWord();
+  const fontSize = 18;
+  ctx.font = `bold ${fontSize}px monospace`;
+  const w = ctx.measureText(word).width;
+  const x = Math.random() * (canvas.width - w - 20) + 10;
+  fallingWords.push({
+    word,
+    x,
+    y: -20,
+    speed: baseSpeed + Math.random() * 0.4,
+    fontSize,
+    matched: false,
+    explodeFrames: 0,
+  });
+}
+
+// ── Input handling ─────────────────────────────────────────
+const input = document.getElementById('type-input');
+input.addEventListener('input', () => {
+  currentInput = input.value.trim().toLowerCase();
+  const idx = fallingWords.findIndex(fw => fw.word === currentInput && !fw.matched);
+  if (idx !== -1) {
+    fallingWords[idx].matched = true;
+    fallingWords[idx].explodeFrames = 18;
+    input.value = '';
+    currentInput = '';
+    score += Math.ceil(fallingWords[idx].word.length * (level * 0.5 + 0.5));
+    document.getElementById('score-disp').textContent = score;
+    if (score > loadBest()) saveBest(score);
+    document.getElementById('best-disp').textContent = loadBest();
+    // Level up every 10 words
+    if (score > level * 80) {
+      level++;
+      baseSpeed += 0.15;
+      spawnInterval = Math.max(50, spawnInterval - 8);
+      document.getElementById('level-disp').textContent = level;
+    }
+  }
+});
+
+// ── Draw helpers ───────────────────────────────────────────
+function drawBackground() {
+  ctx.fillStyle = '#1e293b';
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+  // grid lines
+  ctx.strokeStyle = 'rgba(255,255,255,0.04)';
+  ctx.lineWidth = 1;
+  for (let y = 0; y < canvas.height; y += 40) {
+    ctx.beginPath(); ctx.moveTo(0,y); ctx.lineTo(canvas.width,y); ctx.stroke();
+  }
+}
+
+function drawDangerZone() {
+  ctx.fillStyle = 'rgba(239,68,68,0.12)';
+  ctx.fillRect(0, canvas.height - 30, canvas.width, 30);
+  ctx.strokeStyle = 'rgba(239,68,68,0.5)';
+  ctx.lineWidth = 2;
+  ctx.beginPath(); ctx.moveTo(0, canvas.height-30); ctx.lineTo(canvas.width, canvas.height-30); ctx.stroke();
+}
+
+
+function drawWord(fw) {
+  if (fw.explodeFrames > 0) {
+    // Explosion effect
+    const progress = 1 - fw.explodeFrames / 18;
+    ctx.save();
+    ctx.globalAlpha = 1 - progress;
+    ctx.font = `bold ${fw.fontSize + progress * 12}px monospace`;
+    ctx.fillStyle = `hsl(${120 - progress*30}, 100%, 70%)`;
+    ctx.textAlign = 'center';
+    ctx.fillText(fw.word, fw.x + ctx.measureText(fw.word).width/2, fw.y);
+    ctx.restore();
+    fw.explodeFrames--;
+    if (fw.explodeFrames === 0) {
+      fallingWords = fallingWords.filter(w => w !== fw);
+    }
+    return;
+  }
+  // Highlight typed prefix
+  const typed = currentInput;
+  const word = fw.word;
+  ctx.font = `bold ${fw.fontSize}px monospace`;
+  // Draw background pill
+  const totalW = ctx.measureText(word).width + 12;
+  const dangerRatio = fw.y / (canvas.height - 30);
+  const hue = Math.max(0, 120 - dangerRatio * 120);
+  ctx.fillStyle = `hsla(${hue},60%,20%,0.8)`;
+  roundRect(ctx, fw.x - 6, fw.y - fw.fontSize, totalW, fw.fontSize + 8, 6);
+  ctx.fill();
+  // Draw text
+  let cx = fw.x;
+  for (let i = 0; i < word.length; i++) {
+    const ch = word[i];
+    const chW = ctx.measureText(ch).width;
+    if (i < typed.length && ch === typed[i]) {
+      ctx.fillStyle = '#4ade80';
+    } else {
+      ctx.fillStyle = `hsl(${hue},80%,75%)`;
+    }
+    ctx.fillText(ch, cx, fw.y);
+    cx += chW;
+  }
+}
+
+function roundRect(ctx, x, y, w, h, r) {
+  ctx.beginPath();
+  ctx.moveTo(x+r, y);
+  ctx.lineTo(x+w-r, y);
+  ctx.quadraticCurveTo(x+w, y, x+w, y+r);
+  ctx.lineTo(x+w, y+h-r);
+  ctx.quadraticCurveTo(x+w, y+h, x+w-r, y+h);
+  ctx.lineTo(x+r, y+h);
+  ctx.quadraticCurveTo(x, y+h, x, y+h-r);
+  ctx.lineTo(x, y+r);
+  ctx.quadraticCurveTo(x, y, x+r, y);
+  ctx.closePath();
+}
+
+// ── Game loop ──────────────────────────────────────────────
+function gameLoop() {
+  if (!gameRunning) return;
+  frameCount++;
+
+  drawBackground();
+  drawDangerZone();
+
+  // Spawn
+  if (frameCount % spawnInterval === 0) spawnWord();
+
+  // Update & draw words
+  for (let i = fallingWords.length - 1; i >= 0; i--) {
+    const fw = fallingWords[i];
+    if (fw.matched) { drawWord(fw); continue; }
+    fw.y += fw.speed;
+    if (fw.y >= canvas.height) {
+      fallingWords.splice(i, 1);
+      lives--;
+      updateLives();
+      if (lives <= 0) { gameOver(); return; }
+    } else {
+      drawWord(fw);
+    }
+  }
+
+  // HUD on canvas
+  ctx.font = 'bold 14px sans-serif';
+  ctx.fillStyle = 'rgba(255,255,255,0.5)';
+  ctx.textAlign = 'left';
+  ctx.fillText(`Lv.${level}`, 8, 20);
+
+  rafId = requestAnimationFrame(gameLoop);
+}
+
+// ── Life display ───────────────────────────────────────────
+function updateLives() {
+  const el = document.getElementById('lives-disp');
+  el.textContent = '❤️'.repeat(lives) + '🖤'.repeat(3 - lives);
+  el.classList.add('life-anim');
+  setTimeout(() => el.classList.remove('life-anim'), 400);
+}
+
+// ── Start / Game over ──────────────────────────────────────
+function startGame() {
+  score = 0; lives = 3; level = 1; frameCount = 0;
+  baseSpeed = 0.6; spawnInterval = 120;
+  fallingWords = []; currentInput = '';
+  input.value = '';
+  gameRunning = true;
+  document.getElementById('overlay').innerHTML = '';
+  document.getElementById('score-disp').textContent = '0';
+  document.getElementById('level-disp').textContent = '1';
+  document.getElementById('best-disp').textContent = loadBest();
+  updateLives();
+  input.focus();
+  if (rafId) cancelAnimationFrame(rafId);
+  rafId = requestAnimationFrame(gameLoop);
+}
+
+function gameOver() {
+  gameRunning = false;
+  cancelAnimationFrame(rafId);
+  if (score > loadBest()) saveBest(score);
+
+  // Draw game over on canvas
+  ctx.fillStyle = 'rgba(0,0,0,0.7)';
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+  ctx.textAlign = 'center';
+  ctx.font = 'bold 36px sans-serif';
+  ctx.fillStyle = '#ef4444';
+  ctx.fillText('GAME OVER', canvas.width/2, canvas.height/2 - 30);
+  ctx.font = 'bold 20px sans-serif';
+  ctx.fillStyle = '#fff';
+  ctx.fillText(`スコア: ${score}`, canvas.width/2, canvas.height/2 + 10);
+  ctx.font = '16px sans-serif';
+  ctx.fillStyle = '#94a3b8';
+  ctx.fillText(`ベスト: ${loadBest()}`, canvas.width/2, canvas.height/2 + 38);
+
+  document.getElementById('overlay').innerHTML =
+    `<button onclick="startGame()" class="mt-3 px-8 py-3 bg-indigo-600 hover:bg-indigo-500 text-white rounded-xl font-bold text-lg transition" aria-label="リスタート">もう一度</button>`;
+}
+
+// Init
+document.getElementById('best-disp').textContent = loadBest();
+</script>
+</body>
+</html>
